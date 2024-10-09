@@ -2,10 +2,8 @@ import os
 import time
 import json
 import logging
-from datetime import datetime, timedelta
-
+from datetime import datetime, timedelta, timezone
 import pandas as pd
-import pandas_ta as ta
 import numpy as np
 import pyupbit
 import requests
@@ -115,6 +113,19 @@ def log_to_notion(trade: dict):
         logging.error(f"Exception in log_to_notion: {e}")
 
 # =====================
+# ATR 계산 함수
+# =====================
+
+def compute_atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
+    """평균 실제 범위(ATR)를 계산합니다."""
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/length, adjust=False).mean()
+    return atr
+
+# =====================
 # 트렌드라인 분석 함수
 # =====================
 
@@ -198,12 +209,26 @@ def generate_trade_signal(ohlcv: pd.DataFrame, lookback: int, tp_mult: float, sl
     r_val = r_coefs[1] + len(close) * r_coefs[0]
     s_val = s_coefs[1] + len(close) * s_coefs[0]
 
-    # ATR 계산
-    atr = ta.atr(window['high'], window['low'], window['close'], length=14)
+    # ATR 계산 (compute_atr 함수 사용)
+    atr = compute_atr(window['high'], window['low'], window['close'], length=14)
     latest_atr = atr.iloc[-1]
 
+    # 저항선과 지지선의 기울기 비교 조건 추가
+    resist_slope = r_coefs[0]
+    support_slope = s_coefs[0]
+    slope_condition = False
+
+    # 상승 추세일 때
+    if resist_slope > 0 and support_slope > 0:
+        if support_slope > resist_slope:
+            slope_condition = True
+    # 하락 추세일 때
+    elif resist_slope < 0 and support_slope < 0:
+        if support_slope > resist_slope:
+            slope_condition = True
+
     signal = None
-    if latest_candle['close'] > r_val:
+    if latest_candle['close'] > r_val and slope_condition:
         signal = 'Buy'
     elif latest_candle['close'] < s_val:
         signal = 'Sell'
@@ -238,7 +263,8 @@ def execute_trade(signal: dict, state: dict, ohlcv: pd.DataFrame, ticker: str = 
     support = signal.get('Support', None)
     current_time = ohlcv.index[-1]
     volume = ohlcv['volume'].iloc[-1]
-    atr = ta.atr(ohlcv['high'], ohlcv['low'], ohlcv['close'], length=14).iloc[-1]
+    # ATR 계산 (pandas_ta 대체)
+    atr = compute_atr(ohlcv['high'], ohlcv['low'], ohlcv['close'], length=14).iloc[-1]
 
     # Ticker 기본값 설정
     if ticker is None:
@@ -461,7 +487,8 @@ def main():
 
     while True:
         try:
-            current_time = datetime.utcnow() + timedelta(hours=9)  # KST 시간으로 변환
+            # UTC 타임존 인식으로 변경
+            current_time = datetime.now(timezone.utc) + timedelta(hours=9)  # KST 시간으로 변환
             # 다음 60분 마크까지 대기
             minute = current_time.minute
             second = current_time.second
@@ -520,7 +547,7 @@ def main():
                     else:
                         # 자동 매도 조건 확인 (hold period)
                         if state.get('entry_time'):
-                            entry_time = datetime.fromisoformat(state['entry_time'])
+                            entry_time = datetime.fromisoformat(state['entry_time']).replace(tzinfo=timezone.utc)
                             candles_since_entry = (current_time - entry_time) // timedelta(minutes=60)
                             if candles_since_entry >= hold_candles:
                                 print(f"[{datetime.now()}] Hold period exceeded for {current_ticker}. Executing automatic sell.")
@@ -566,4 +593,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
