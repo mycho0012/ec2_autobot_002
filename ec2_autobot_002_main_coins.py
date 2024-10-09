@@ -428,8 +428,8 @@ def main():
     state = load_state()
 
     # 초기 설정
-    interval = "minute30"      # Upbit API에서 지원하는 인터벌
-    lookback = 50               # 추세선을 계산할 기간
+    interval = "minute60"      # Upbit API에서 지원하는 인터벌
+    lookback = 72               # 추세선을 계산할 기간
     tp_mult = 3.0               # 테이크 프로핏 배수
     sl_mult = 3.0               # 스톱 로스 배수
     atr_mult = 1.0              # ATR 배수 (현재 사용되지 않음, 필요 시 조정)
@@ -462,17 +462,13 @@ def main():
     while True:
         try:
             current_time = datetime.utcnow() + timedelta(hours=9)  # KST 시간으로 변환
-            # 다음 30분 마크까지 대기
+            # 다음 60분 마크까지 대기
             minute = current_time.minute
             second = current_time.second
-            if minute < 30:
-                next_minute = 30
-            else:
-                next_minute = 60
-            sleep_seconds = (next_minute - minute) * 60 - second
+            sleep_seconds = (60 - minute) * 60 - second
             if sleep_seconds <= 0:
-                sleep_seconds += 1800  # 30분
-            print(f"[{datetime.now()}] Sleeping for {sleep_seconds} seconds until next 30-minute mark.")
+                sleep_seconds += 3600  # 60분
+            print(f"[{datetime.now()}] Sleeping for {sleep_seconds} seconds until next 60-minute mark.")
             time.sleep(sleep_seconds)
 
             # 포지션이 없을 때: 매수 신호 탐색
@@ -525,7 +521,7 @@ def main():
                         # 자동 매도 조건 확인 (hold period)
                         if state.get('entry_time'):
                             entry_time = datetime.fromisoformat(state['entry_time'])
-                            candles_since_entry = (current_time - entry_time) // timedelta(minutes=30)
+                            candles_since_entry = (current_time - entry_time) // timedelta(minutes=60)
                             if candles_since_entry >= hold_candles:
                                 print(f"[{datetime.now()}] Hold period exceeded for {current_ticker}. Executing automatic sell.")
                                 # AutoSell 신호 생성
@@ -570,3 +566,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
