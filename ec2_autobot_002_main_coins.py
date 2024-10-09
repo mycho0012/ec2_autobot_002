@@ -88,22 +88,57 @@ def log_to_notion(trade: dict):
     """Notion 데이터베이스에 거래 내역을 기록합니다."""
     try:
         properties = {
-            "Trade ID": {"title": [{"text": {"content": str(trade['Trade ID'])}}]},
-            "Ticker": {"rich_text": [{"text": {"content": trade['Ticker']}}]},  # 티커 추가
-            "Entry Time": {"date": {"start": trade['Entry Time'].isoformat()}},
-            "Exit Time": {"date": {"start": trade['Exit Time'].isoformat()} if trade['Exit Time'] else None},
-            "Signal Type": {"rich_text": {"name": trade['Signal Type']}},
-            "Entry Price": {"number": trade['Entry Price']},
-            "Exit Price": {"number": trade['Exit Price'] if trade['Exit Price'] is not None else None},
-            "Log Close Price": {"number": trade['Log Close Price']},
-            "Resistance Level": {"number": trade['Resistance Level']},
-            "Support Level": {"number": trade['Support Level']},
-            "Volume": {"number": trade['Volume']},
-            "ATR": {"number": trade['ATR']},
-            "Reason for Entry": {"rich_text": [{"text": {"content": trade['Reason for Entry']}}]},
-            "Reason for Exit": {"rich_text": [{"text": {"content": trade['Reason for Exit']}}] if trade['Reason for Exit'] else None},
-            "Profit/Loss": {"number": trade['Profit/Loss'] if trade['Profit/Loss'] is not None else None},
-            "Return (%)": {"number": trade['Return (%)'] if trade['Return (%)'] is not None else None},
+            "Trade ID": {
+                "title": [
+                    {
+                        "text": {
+                            "content": str(trade['Trade ID'])
+                        }
+                    }
+                ]
+            },
+            "Ticker": {
+                "rich_text": [
+                    {
+                        "text": {
+                            "content": trade['Ticker']
+                        }
+                    }
+                ]
+            },
+            "Entry Time": {
+                "rich_text": [
+                    {
+                        "text": {
+                            "content": trade['Entry Time']
+                        }
+                    }
+                ]
+            },
+            "Exit Time": {
+                "rich_text": [
+                    {
+                        "text": {
+                            "content": trade['Exit Time']
+                        }
+                    }
+                ] if trade['Exit Time'] else []
+            },
+            "Signal Type": {
+                "rich_text": [
+                    {
+                        "text": {
+                            "content": trade['Signal Type']
+                        }
+                    }
+                ]
+            },
+            "Entry Price": {
+                "number": trade['Entry Price']
+            },
+            "Exit Price": {
+                "number": trade['Exit Price']
+            }
         }
         notion.pages.create(
             parent={"database_id": NOTION_DATABASE_ID},
@@ -303,21 +338,12 @@ def execute_trade(signal: dict, state: dict, ohlcv: pd.DataFrame, ticker: str = 
             # Notion 로그
             trade_info = {
                 'Trade ID': trade_id,
-                'Ticker': ticker,  # 티커 포함
-                'Entry Time': current_time,
+                'Ticker': ticker,
+                'Entry Time': state['entry_time'],
                 'Exit Time': None,
                 'Signal Type': 'Buy',
                 'Entry Price': current_price,
-                'Exit Price': None,
-                'Log Close Price': np.log(current_price),
-                'Resistance Level': resistance,
-                'Support Level': support,
-                'Volume': volume,
-                'ATR': atr,
-                'Reason for Entry': 'Price crossed above Resistance',
-                'Reason for Exit': None,
-                'Profit/Loss': None,
-                'Return (%)': None,
+                'Exit Price': None
             }
             log_to_notion(trade_info)
 
@@ -369,21 +395,12 @@ def execute_trade(signal: dict, state: dict, ohlcv: pd.DataFrame, ticker: str = 
             # Notion 로그
             trade_info = {
                 'Trade ID': trade_id,
-                'Ticker': ticker,  # 티커 포함
-                'Entry Time': datetime.fromisoformat(entry_time) if entry_time else None,
-                'Exit Time': current_time,
+                'Ticker': ticker,
+                'Entry Time': entry_time if entry_time else "",
+                'Exit Time': current_time.isoformat(),
                 'Signal Type': 'Sell' if signal_type == 'Sell' else 'AutoSell',
                 'Entry Price': entry_price,
-                'Exit Price': current_price,
-                'Log Close Price': np.log(current_price),
-                'Resistance Level': resistance,
-                'Support Level': support,
-                'Volume': volume,
-                'ATR': atr,
-                'Reason for Entry': 'Price crossed above Resistance',
-                'Reason for Exit': 'Price crossed below Support' if signal_type == 'Sell' else 'Hold Period Exceeded',
-                'Profit/Loss': profit_loss,
-                'Return (%)': return_pct,
+                'Exit Price': current_price
             }
             log_to_notion(trade_info)
 
