@@ -9,15 +9,15 @@ import pyupbit
 import requests
 from dotenv import load_dotenv
 from notion_client import Client
+import uuid
 
 # =====================
 # 환경 변수 로드
 # =====================
 load_dotenv()
 
-# 텔레그램 설정
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+# Slack 설정
+SLACK_WEBHOOK_URL = os.getenv('SLACK_WEBHOOK_URL')
 
 # Notion 설정
 NOTION_TOKEN = os.getenv('NOTION_TOKEN')
@@ -67,22 +67,19 @@ def load_state(filename=STATE_FILE):
         "last_processed_time": None,  # 마지막으로 처리한 캔들의 시간
         "initial_balance": 0.0,       # 초기 KRW 잔고
         "entry_time": None,           # 포지션 진입 시간
-        "last_trade_id": 0            # 마지막 거래 ID
+        "last_trade_id": ""           # 마지막 거래 ID
     }
 
-def send_telegram_message(message: str):
-    """텔레그램 봇을 통해 메시지를 전송합니다."""
+def send_slack_message(message: str):
+    """Slack을 통해 메시지를 전송합니다."""
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {
-            'chat_id': TELEGRAM_CHAT_ID,
-            'text': message
-        }
-        response = requests.post(url, data=data)
+        headers = {'Content-Type': 'application/json'}
+        data = {'text': message}
+        response = requests.post(SLACK_WEBHOOK_URL, headers=headers, data=json.dumps(data))
         if response.status_code != 200:
-            logging.error(f"Failed to send Telegram message: {response.text}")
+            logging.error(f"Failed to send Slack message: {response.text}")
     except Exception as e:
-        logging.error(f"Exception in send_telegram_message: {e}")
+        logging.error(f"Exception in send_slack_message: {e}")
 
 def log_to_notion(trade: dict):
     """Notion 데이터베이스에 거래 내역을 기록합니다."""
@@ -106,44 +103,56 @@ def log_to_notion(trade: dict):
                     }
                 ]
             },
-            "Entry Time": {
+            "Type": {
+                "select": {
+                    "name": trade['Type']
+                }
+            },
+            "Timestamp": {
+                "date": {
+                    "start": trade['Timestamp']
+                }
+            },
+            "Price": {
+                "number": trade['Price']
+            },
+            "Stop Loss": {
+                "number": trade.get('Stop Loss', None)
+            },
+            "Take Profit": {
+                "number": trade.get('Take Profit', None)
+            },
+            "Quantity": {
+                "number": trade.get('Quantity', None)
+            },
+            "Status": {
+                "select": {
+                    "name": trade.get('Status', 'Open')
+                }
+            },
+            "Sell Timestamp": {
+                "date": {
+                    "start": trade.get('Sell Timestamp', None)
+                }
+            },
+            "Sell Price": {
+                "number": trade.get('Sell Price', None)
+            },
+            "Buy Trade ID": {
                 "rich_text": [
                     {
                         "text": {
-                            "content": trade['Entry Time']
+                            "content": str(trade.get('Buy Trade ID', ''))
                         }
                     }
                 ]
-            },
-            "Exit Time": {
-                "rich_text": [
-                    {
-                        "text": {
-                            "content": trade['Exit Time']
-                        }
-                    }
-                ] if trade['Exit Time'] else []
-            },
-            "Signal Type": {
-                "rich_text": [
-                    {
-                        "text": {
-                            "content": trade['Signal Type']
-                        }
-                    }
-                ]
-            },
-            "Entry Price": {
-                "number": trade['Entry Price']
-            },
-            "Exit Price": {
-                "number": trade['Exit Price']
             }
         }
         notion.pages.create(
             parent={"database_id": NOTION_DATABASE_ID},
             properties=properties
         )
+        logging.info(f"Trade logged to Notion: {trade['Trade ID']}")
     except Exception as e:
         logging.error(f"Exception in log_to_notion: {e}")
 
@@ -280,6 +289,66 @@ def generate_trade_signal(ohlcv: pd.DataFrame, lookback: int, tp_mult: float, sl
         return None
 
 # =====================
+# 매수/매도 거래 조회 함수
+# =====================
+
+def get_last_open_buy_trade(ticker: str):
+    """
+    특정 티커에 대한 가장 최근 열린 매수 거래 정보를 Notion에서 조회합니다.
+    """
+    try:
+        response = notion.databases.query(
+            **{
+                "database_id": NOTION_DATABASE_ID,
+                "filter": {
+                    "and": [
+                        {
+                            "property": "Ticker",
+                            "rich_text": {
+                                "equals": ticker
+                            }
+                        },
+                        {
+                            "property": "Type",
+                            "select": {
+                                "equals": "Buy"
+                            }
+                        },
+                        {
+                            "property": "Status",
+                            "select": {
+                                "equals": "Open"
+                            }
+                        }
+                    ]
+                },
+                "sorts": [
+                    {
+                        "property": "Timestamp",
+                        "direction": "descending"
+                    }
+                ],
+                "page_size": 1
+            }
+        )
+        logging.info(f"get_last_open_buy_trade response for {ticker}: {response}")
+        if response['results']:
+            trade = response['results'][0]
+            trade_id = trade['properties']['Trade ID']['title'][0]['text']['content']
+            page_id = trade['id']
+            logging.info(f"Found trade: Trade ID {trade_id}, Page ID {page_id}")
+            return {
+                'Trade ID': trade_id,
+                'Page ID': page_id
+            }
+        else:
+            logging.info(f"No open trade found for {ticker}.")
+            return None
+    except Exception as e:
+        logging.error(f"Exception in get_last_open_buy_trade: {e}")
+        return None
+
+# =====================
 # 매수/매도 주문 실행 함수
 # =====================
 
@@ -289,7 +358,7 @@ def execute_trade(signal: dict, state: dict, ohlcv: pd.DataFrame, ticker: str = 
     `ticker`는 거래할 코인의 티커입니다.
     `reason_override`는 자동 매도 시 'Hold Period Exceeded'와 같은 이유를 지정할 때 사용됩니다.
     """
-    trade_id = state.get('last_trade_id', 0) + 1
+    trade_id = str(uuid.uuid4())  # 고유한 Trade ID 생성
     signal_type = signal['Signal']
     entry_price = signal['Entry Price']
     tp_price = signal.get('TP', None)
@@ -298,27 +367,34 @@ def execute_trade(signal: dict, state: dict, ohlcv: pd.DataFrame, ticker: str = 
     support = signal.get('Support', None)
     current_time = ohlcv.index[-1]
     volume = ohlcv['volume'].iloc[-1]
-    # ATR 계산 (pandas_ta 대체)
+    # ATR 계산 (compute_atr 함수 사용)
     atr = compute_atr(ohlcv['high'], ohlcv['low'], ohlcv['close'], length=14).iloc[-1]
 
     # Ticker 기본값 설정
     if ticker is None:
         ticker = "KRW-BTC"
 
-    if signal_type == 'Buy' and state['position'] == 0:
+    if signal_type == 'Buy':
+        # Notion에서 열린 포지션 확인
+        open_trade = get_last_open_buy_trade(ticker)
+        if open_trade:
+            logging.info(f"Buy signal received but an open position exists for {ticker}: Trade ID {open_trade['Trade ID']}")
+            send_slack_message(f"매수 신호가 감지되었으나 이미 열린 포지션이 존재합니다: Trade ID {open_trade['Trade ID']}, Ticker: {ticker}")
+            return state
+
         krw_balance = upbit.get_balance("KRW")
         if krw_balance is None:
             krw_balance = 0.0
         trade_amount = krw_balance * 0.3  # KRW 잔고의 30% 사용
         if trade_amount < 5000:
             logging.info(f"Trade ID {trade_id} skipped due to insufficient KRW balance.")
-            print(f"[{datetime.now()}] Trade ID {trade_id} skipped due to insufficient KRW balance.")
+            send_slack_message(f"[{datetime.now()}] Trade ID {trade_id} skipped due to insufficient KRW balance.")
             return state
         try:
             # 시장가 매수
             order = upbit.buy_market_order(ticker, trade_amount)
             logging.info(f"Trade ID {trade_id} Buy Order: {order}")
-            print(f"[{datetime.now()}] Trade ID {trade_id}: Buy order placed for {trade_amount:,.0f} KRW")
+            send_slack_message(f"[{datetime.now()}] Trade ID {trade_id}: Buy order placed for {trade_amount:,.0f} KRW of {ticker}")
             time.sleep(1)  # API 호출 간 대기
 
             # 실제 매수 가격 확인
@@ -335,19 +411,21 @@ def execute_trade(signal: dict, state: dict, ohlcv: pd.DataFrame, ticker: str = 
             state['entry_time'] = current_time.isoformat()  # 진입 시간 저장
             save_state(state)
 
-            # Notion 로그
+            # Notion 로그 - Buy
             trade_info = {
                 'Trade ID': trade_id,
                 'Ticker': ticker,
-                'Entry Time': state['entry_time'],
-                'Exit Time': None,
-                'Signal Type': 'Buy',
-                'Entry Price': current_price,
-                'Exit Price': None
+                'Type': 'Buy',
+                'Timestamp': state['entry_time'],
+                'Price': current_price,
+                'Stop Loss': sl_price,
+                'Take Profit': tp_price,
+                'Quantity': qty_bought,
+                'Status': 'Open'
             }
             log_to_notion(trade_info)
 
-            # 텔레그램 메시지
+            # Slack 메시지
             message = (
                 f"Buy Order Executed\n"
                 f"Trade ID: {trade_id}\n"
@@ -356,21 +434,40 @@ def execute_trade(signal: dict, state: dict, ohlcv: pd.DataFrame, ticker: str = 
                 f"Amount: {trade_amount:,.0f} KRW\n"
                 f"Qty: {qty_bought:.6f} {ticker.split('-')[1]}"
             )
-            send_telegram_message(message)
+            send_slack_message(message)
         except Exception as e:
             logging.error(f"Exception during buy order for Trade ID {trade_id}: {e}")
-            print(f"[{datetime.now()}] Exception during buy order for Trade ID {trade_id}: {e}")
+            send_slack_message(f"[{datetime.now()}] Exception during buy order for Trade ID {trade_id}: {e}")
 
-    elif (signal_type == 'Sell' and state['position'] == 1 and state['current_ticker'] == ticker) or \
-         (signal_type == 'AutoSell' and state['position'] == 1 and state['current_ticker'] == ticker):
-        qty = state['qty']
-        entry_price = state.get('entry_price', 0.0)
-        entry_time = state.get('entry_time', None)
+    elif signal_type in ['Sell', 'AutoSell']:
+        if ticker is None:
+            logging.error("Ticker is None during Sell/AutoSell execution.")
+            return state
+
+        open_trade = get_last_open_buy_trade(ticker)
+        if not open_trade:
+            logging.info(f"Sell signal received but no open position exists for {ticker}.")
+            send_slack_message(f"매도 신호가 감지되었으나 열린 포지션이 존재하지 않습니다: {ticker}")
+            return state
+
+        status = "Open"  # 이미 get_last_open_buy_trade 함수에서 확인했으므로 'Open'으로 고정
+        if status != 'Open':
+            logging.info(f"Sell signal received but the last trade for {ticker} is not open: Status {status}")
+            send_slack_message(f"매도 신호가 감지되었으나 마지막 거래가 열린 상태가 아닙니다: Trade ID {open_trade['Trade ID']}, Ticker: {ticker}")
+            return state
+
         try:
+            buy_trade_id = open_trade['Trade ID']
+            page_id = open_trade['Page ID']
+            qty = state.get('qty', 0.0)
+            if qty <= 0.0:
+                raise Exception(f"Invalid quantity {qty} for Sell trade.")
+
             # 시장가 매도
             order = upbit.sell_market_order(ticker, qty)
-            logging.info(f"Trade ID {trade_id} Sell Order: {order}")
-            print(f"[{datetime.now()}] Trade ID {trade_id}: Sell order placed for {qty:.6f} {ticker}")
+            logging.info(f"Sell Order: {order}")
+            send_slack_message(f"[{datetime.now()}] Trade ID {trade_id}: Sell order placed for {qty:.6f} {ticker}")
+
             time.sleep(1)  # API 호출 간 대기
 
             # 실제 매도 가격 확인
@@ -378,48 +475,71 @@ def execute_trade(signal: dict, state: dict, ohlcv: pd.DataFrame, ticker: str = 
             if current_price is None:
                 raise Exception("Failed to get current price after sell order.")
             trade_amount = qty * current_price
-            trade_cost = qty * entry_price
+            trade_cost = qty * state.get('entry_price', 0.0)
             profit_loss = trade_amount - trade_cost
             return_pct = (profit_loss / trade_cost) * 100 if trade_cost != 0 else 0.0
 
             # 상태 업데이트
+            trade_id_sell = str(uuid.uuid4())
             state['position'] = 0
             state['current_ticker'] = None
             state['qty'] = 0.0
-            state['last_trade_id'] = trade_id
+            state['last_trade_id'] = trade_id_sell
             state['last_processed_time'] = current_time.isoformat()
             state['entry_price'] = 0.0  # 진입 가격 초기화
             state['entry_time'] = None  # 진입 시간 초기화
             save_state(state)
 
-            # Notion 로그
+            # Notion 로그 - Sell
             trade_info = {
-                'Trade ID': trade_id,
+                'Trade ID': trade_id_sell,
                 'Ticker': ticker,
-                'Entry Time': entry_time if entry_time else "",
-                'Exit Time': current_time.isoformat(),
-                'Signal Type': 'Sell' if signal_type == 'Sell' else 'AutoSell',
-                'Entry Price': entry_price,
-                'Exit Price': current_price
+                'Type': 'Sell',
+                'Timestamp': current_time.isoformat(),
+                'Price': current_price,
+                'Status': 'Closed',
+                'Sell Timestamp': current_time.isoformat(),
+                'Sell Price': current_price,
+                'Buy Trade ID': buy_trade_id
             }
             log_to_notion(trade_info)
 
-            # 텔레그램 메시지
-            reason = 'Hold Period Exceeded' if signal_type == 'AutoSell' else 'Price crossed below Support'
+            # 매수 거래의 Status를 'Closed'로 업데이트
+            try:
+                notion.pages.update(
+                    page_id=page_id,
+                    properties={
+                        "Status": {
+                            "select": {
+                                "name": "Closed"
+                            }
+                        }
+                    }
+                )
+                logging.info(f"Updated Buy Trade ID {buy_trade_id} Status to Closed.")
+                send_slack_message(f"✅ Buy Trade ID {buy_trade_id} Status updated to Closed.")
+                print(f"✅ Buy Trade ID {buy_trade_id} Status updated to Closed.")
+            except Exception as e:
+                logging.error(f"Exception in updating Buy trade status: {e}")
+                send_slack_message(f"❌ 오류 발생: Buy Trade ID {buy_trade_id} 상태 업데이트 실패.")
+                print(f"❌ 오류 발생: Buy Trade ID {buy_trade_id} 상태 업데이트 실패.")
+
+            # Slack 메시지
+            reason = reason_override if reason_override else ('Hold Period Exceeded' if signal_type == 'AutoSell' else 'Price crossed below Support')
             message = (
                 f"Sell Order Executed\n"
-                f"Trade ID: {trade_id}\n"
+                f"Trade ID: {trade_id_sell}\n"
                 f"Ticker: {ticker}\n"
                 f"Sell Price: {current_price:,.0f} KRW\n"
-                f"Amount: {qty:.6f} {ticker.split('-')[1]}\n"
+                f"Qty: {qty:.6f} {ticker.split('-')[1]}\n"
                 f"Profit/Loss: {profit_loss:,.0f} KRW\n"
                 f"Return: {return_pct:.2f}%\n"
                 f"Reason: {reason}"
             )
-            send_telegram_message(message)
+            send_slack_message(message)
         except Exception as e:
-            logging.error(f"Exception during sell order for Trade ID {trade_id}: {e}")
-            print(f"[{datetime.now()}] Exception during sell order for Trade ID {trade_id}: {e}")
+            logging.error(f"Exception during sell order for Trade ID {buy_trade_id}: {e}")
+            send_slack_message(f"[{datetime.now()}] Exception during sell order for Trade ID {buy_trade_id}: {e}")
     else:
         # No action required
         pass
@@ -471,12 +591,12 @@ def main():
     state = load_state()
 
     # 초기 설정
-    interval = "minute60"      # Upbit API에서 지원하는 인터벌
-    lookback = 72               # 추세선을 계산할 기간
-    tp_mult = 3.0               # 테이크 프로핏 배수
-    sl_mult = 3.0               # 스톱 로스 배수
-    atr_mult = 1.0              # ATR 배수 (현재 사용되지 않음, 필요 시 조정)
-    hold_candles = 12           # 포지션을 유지할 최대 캔들 수
+    interval = "minute30"       # Upbit API에서 지원하는 인터벌
+    lookback = 50                # 추세선을 계산할 기간
+    tp_mult = 3.0                # 테이크 프로핏 배수
+    sl_mult = 3.0                # 스톱 로스 배수
+    atr_mult = 1.0               # ATR 배수 (현재 사용되지 않음, 필요 시 조정)
+    hold_candles = 24            # 포지션을 유지할 최대 캔들 수 (30분 기준)
 
     # 봇 시작 메시지 전송
     initial_balance = upbit.get_balance("KRW")
@@ -485,7 +605,7 @@ def main():
     state['initial_balance'] = state.get('initial_balance', initial_balance)
     save_state(state)
     print(f"[{datetime.now()}] Autotrading Bot started. Current KRW Balance: {initial_balance:,.0f} KRW")
-    send_telegram_message(f"Autotrading Bot started successfully at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.\nCurrent KRW Balance: {initial_balance:,.0f} KRW")
+    send_slack_message(f"Autotrading Bot started successfully at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.\nCurrent KRW Balance: {initial_balance:,.0f} KRW")
 
     # Initialize last_processed_time if not set
     if state.get('last_processed_time') is None:
@@ -504,85 +624,82 @@ def main():
 
     while True:
         try:
-            # UTC 타임존 인식으로 변경
+            # KST 타임존 인식으로 변경
             current_time = datetime.now(timezone.utc) + timedelta(hours=9)  # KST 시간으로 변환
-            # 다음 60분 마크까지 대기
+            # 다음 30분 마크까지 대기
             minute = current_time.minute
             second = current_time.second
-            sleep_seconds = (60 - minute) * 60 - second
+            sleep_minutes = 30 - (minute % 30)
+            sleep_seconds = sleep_minutes * 60 - second
             if sleep_seconds <= 0:
-                sleep_seconds += 3600  # 60분
-            print(f"[{datetime.now()}] Sleeping for {sleep_seconds} seconds until next 60-minute mark.")
+                sleep_seconds += 1800  # 30분
+            print(f"[{datetime.now()}] Sleeping for {sleep_seconds} seconds until next 30-minute mark.")
             time.sleep(sleep_seconds)
 
-            # 포지션이 없을 때: 매수 신호 탐색
-            if state['position'] == 0:
+            if state.get('position', 0) == 1 and state.get('current_ticker'):
+                # 포지션이 열려 있는 경우: 해당 티커에 대한 Sell 시그널만 처리
+                ticker = state['current_ticker']
+                data = get_latest_ohlcv(ticker, interval=interval, count=lookback + 2)
+                if data.empty:
+                    continue
+                trade_signal = generate_trade_signal(data, lookback=lookback, tp_mult=tp_mult, sl_mult=sl_mult, atr_mult=atr_mult)
+                if trade_signal and trade_signal['Signal'] in ['Sell', 'AutoSell']:
+                    print(f"[{datetime.now()}] Sell signal detected for {ticker}. Executing sell...")
+                    state = execute_trade(
+                        trade_signal,
+                        state,
+                        data,
+                        ticker=ticker
+                    )
+                else:
+                    print(f"[{datetime.now()}] No sell signal detected for {ticker}.")
+                
+                # 자동 매도 조건 확인 (hold period)
+                if state.get('position', 0) == 1 and state.get('entry_time'):
+                    entry_time = datetime.fromisoformat(state['entry_time']).replace(tzinfo=timezone.utc) + timedelta(hours=9)  # KST
+                    candles_since_entry = (current_time - entry_time) // timedelta(minutes=30)
+                    if candles_since_entry >= hold_candles:
+                        print(f"[{datetime.now()}] Hold period exceeded for {ticker}. Executing automatic sell.")
+                        # AutoSell 신호 생성
+                        auto_sell_signal = {
+                            'Signal': 'AutoSell'
+                        }
+                        state = execute_trade(
+                            auto_sell_signal,
+                            state,
+                            data,
+                            ticker=ticker,
+                            reason_override='Hold Period Exceeded'
+                        )
+
+            else:
+                # 포지션이 없는 경우: 상위 10개 코인 중 매수 시그널 탐색
                 top_coins = get_top_coins_by_volume(limit=10)
-                buy_signals = []
                 for ticker in top_coins:
                     data = get_latest_ohlcv(ticker, interval=interval, count=lookback + 2)
                     if data.empty:
                         continue
                     trade_signal = generate_trade_signal(data, lookback=lookback, tp_mult=tp_mult, sl_mult=sl_mult, atr_mult=atr_mult)
                     if trade_signal and trade_signal['Signal'] == 'Buy':
-                        # 해당 코인의 거래대금 가져오기
-                        ohlcv_day = pyupbit.get_ohlcv(ticker, interval="day", count=1)
-                        if not ohlcv_day.empty:
-                            trade_volume = ohlcv_day['close'].iloc[-1] * ohlcv_day['volume'].iloc[-1]
-                        else:
-                            trade_volume = 0
-                        buy_signals.append((ticker, trade_volume, trade_signal))
-                if buy_signals:
-                    # 거래대금 기준으로 내림차순 정렬 후 상위 코인 선택
-                    buy_signals.sort(key=lambda x: x[1], reverse=True)
-                    selected_ticker, _, selected_signal = buy_signals[0]
-                    print(f"[{datetime.now()}] Buy signal detected for {selected_ticker}. Executing buy...")
-                    state = execute_trade(
-                        selected_signal,
-                        state,
-                        get_latest_ohlcv(selected_ticker, interval=interval, count=lookback + 2),
-                        ticker=selected_ticker
-                    )
-                else:
-                    print(f"[{datetime.now()}] No buy signals detected among top 10 coins.")
-            else:
-                # 포지션이 있을 때: 매도 신호 확인
-                current_ticker = state['current_ticker']
-                data = get_latest_ohlcv(current_ticker, interval=interval, count=lookback + 2)
-                if data.empty:
-                    print(f"[{datetime.now()}] No data fetched for {current_ticker}.")
-                else:
-                    trade_signal = generate_trade_signal(data, lookback=lookback, tp_mult=tp_mult, sl_mult=sl_mult, atr_mult=atr_mult)
-                    if trade_signal and trade_signal['Signal'] == 'Sell':
-                        print(f"[{datetime.now()}] Sell signal detected for {current_ticker}. Executing sell...")
+                        print(f"[{datetime.now()}] Buy signal detected for {ticker}. Executing buy...")
                         state = execute_trade(
                             trade_signal,
                             state,
                             data,
-                            ticker=current_ticker
+                            ticker=ticker
                         )
-                    else:
-                        # 자동 매도 조건 확인 (hold period)
-                        if state.get('entry_time'):
-                            entry_time = datetime.fromisoformat(state['entry_time']).replace(tzinfo=timezone.utc)
-                            candles_since_entry = (current_time - entry_time) // timedelta(minutes=60)
-                            if candles_since_entry >= hold_candles:
-                                print(f"[{datetime.now()}] Hold period exceeded for {current_ticker}. Executing automatic sell.")
-                                # AutoSell 신호 생성
-                                auto_sell_signal = {
-                                    'Signal': 'AutoSell'
-                                }
-                                state = execute_trade(
-                                    auto_sell_signal,
-                                    state,
-                                    data,
-                                    ticker=current_ticker
-                                )
+                        # 포지션이 생겼으므로 다른 코인에 대한 매수 시도 중지
+                        break
+                    elif trade_signal and trade_signal['Signal'] == 'Sell':
+                        # 포지션이 없는데 Sell 시그널이 발생하면 무시
+                        logging.info(f"Sell signal detected for {ticker} but no open position exists.")
+                        send_slack_message(f"매도 신호가 감지되었으나 열린 포지션이 존재하지 않습니다: {ticker}")
+
             # 현재 잔고 로그
             krw_balance = upbit.get_balance("KRW")
             if krw_balance is None:
                 krw_balance = 0.0
-            current_ticker = state['current_ticker']
+            current_ticker = state.get('current_ticker')
             if current_ticker:
                 current_price = pyupbit.get_current_price(current_ticker)
                 if current_price is None:
@@ -593,20 +710,23 @@ def main():
                     coin_balance = 0.0
                 total_balance = krw_balance + coin_balance * current_price
                 balance_message = (
-                    f"Current Balances -> KRW: {krw_balance:,.0f} KRW, "
+                    f"현재 잔고 -> KRW: {krw_balance:,.0f} KRW, "
                     f"{coin_symbol}: {coin_balance:.6f} {coin_symbol}, "
-                    f"Total: {total_balance:,.0f} KRW"
+                    f"총합: {total_balance:,.0f} KRW"
                 )
             else:
                 total_balance = krw_balance
-                balance_message = f"Current Balances -> KRW: {krw_balance:,.0f} KRW, Total: {total_balance:,.0f} KRW"
+                balance_message = f"현재 잔고 -> KRW: {krw_balance:,.0f} KRW, 총합: {total_balance:,.0f} KRW"
             print(f"[{datetime.now()}] {balance_message}")
-            send_telegram_message(balance_message)
+            send_slack_message(balance_message)
         except Exception as e:
             logging.error(f"Exception in main loop: {e}")
+            send_slack_message(f"[{datetime.now()}] Exception in main loop: {e}")
             print(f"[{datetime.now()}] Exception in main loop: {e}")
             print("Sleeping for 1 minute before retrying...\n")
             time.sleep(60)  # 에러 발생 시 1분 대기 후 재시도
 
 if __name__ == '__main__':
     main()
+
+
